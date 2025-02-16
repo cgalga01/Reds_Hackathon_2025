@@ -1,0 +1,1076 @@
+
+---
+title: "Reds_Comp_2025"
+author: "Villanova Sports Analytics Club"
+date: "16-02-2025"
+output: html_document
+---
+
+This is the Villanova Sports Analytics Club submission ot the 2025 Sports Analytics Hackathon
+
+
+
+Relevant packages
+```{r}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(Metrics)
+library(xgboost)
+
+```
+
+
+
+Loading datasets
+```{r}
+# Load datasets
+lahman <- read_csv("lahman_people.csv")
+savant <- read_csv("savant_data_2021_2023.csv")
+sample <- read_csv("sample_submission.csv")
+
+sample$PLAYING_TIME <- NA
+
+# Create 2024 dataset from sample submission file
+df_2024 <- sample %>%
+  mutate(batter = PLAYER_ID, pitcher = PLAYER_ID) %>%
+  mutate(game_year = 2024)
+
+# Append 2024 dataset to savant data
+savant <- bind_rows(savant, df_2024)
+```
+
+
+## Combining Lahman data
+
+```{r}
+# Process pitchers' data from Lahman dataset
+pitchers_lahman <- savant %>% 
+    select(game_date, game_year, pitcher) %>% 
+    group_by(game_year) %>% 
+    mutate(szn_start = as.IDate(min(game_date))) %>%  # Ensure it's IDate
+    mutate(szn_start = if_else(game_year == 2024, as.IDate("2024-03-28"), szn_start)) %>% 
+    group_by(szn_start, pitcher) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>% 
+    left_join(lahman, by = c("pitcher" = "player_mlb_id")) %>% 
+    select(game_year, pitcher, szn_start, debut, birthDate)
+
+# Process batters' data from Lahman dataset
+batters_lahman <- savant %>% 
+    select(game_date, game_year, batter) %>% 
+    group_by(game_year) %>% 
+    mutate(szn_start = as.IDate(min(game_date))) %>% 
+    mutate(szn_start = if_else(game_year == 2024, as.IDate("2024-03-28"), szn_start)) %>%
+    group_by(szn_start, batter) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>% 
+    left_join(lahman, by = c("batter" = "player_mlb_id")) %>% 
+    select(game_year, batter, szn_start, debut, birthDate)
+
+```
+
+## drop missing & calc age, years in league, rookie
+```{r}
+
+pitchers_lahman <- pitchers_lahman %>% 
+    filter(!is.na(debut)) %>% 
+    mutate(age = floor(interval(birthDate, szn_start) / years(1)),
+           years_in_league = as.numeric(game_year) - year(as.Date(debut)))
+
+batters_lahman <- batters_lahman %>% 
+    filter(!is.na(debut)) %>% 
+    mutate(age = floor(interval(birthDate, szn_start) / years(1)),
+           years_in_league = as.numeric(game_year) - year(as.Date(debut)))
+```
+
+## final lahman dfs
+```{r}
+pitchers_lahman <- pitchers_lahman %>% 
+    rename(id = pitcher) %>% select(-szn_start,-debut,-birthDate,-years_in_league)
+batters_lahman <- batters_lahman %>% 
+    rename(id = batter) %>% select(-szn_start,-debut,-birthDate,-years_in_league)
+
+```
+
+
+
+
+
+## Identifying PAs in Savant Data
+
+```{r}
+pa_flag_vec <- c(
+  field_out = 1, nan = 0, strikeout = 1, double = 1, strikeout_double_play = 1,
+  single = 1, force_out = 1, hit_by_pitch = 1, grounded_into_double_play = 1,
+  home_run = 1, walk = 1, caught_stealing_2b = 0, sac_bunt = 1, triple = 1,
+  sac_fly = 1, field_error = 1, double_play = 1, catcher_interf = 1, fielders_choice_out = 1,
+  fielders_choice = 1, pickoff_1b = 0, other_out = 0, caught_stealing_home = 0, pickoff_caught_stealing_2b = 0,
+  caught_stealing_3b = 0, sac_fly_double_play = 1, pickoff_caught_stealing_home = 0, pickoff_2b = 0, run = 0,
+  triple_play = 1, batter_interference = 1, pickoff_3b = 0, sac_bunt_double_play = 1, pickoff_caught_stealing_3b = 0
+)
+
+
+savant$pa_flag <- ifelse(
+  savant$events %in% names(pa_flag_vec) & pa_flag_vec[savant$events] == 1, 
+  1, 
+  0
+)
+
+
+
+```
+
+
+## calculating woba values
+```{r}
+# Apply weights manually if needed
+weights <- c(single = 0.882, double = 1.254, triple = 1.590, home_run = 2.050, walk = 0.689, hit_by_pitch = 0.720, sac_fly = 0.25)
+
+savant <- savant %>%
+  mutate(
+    weighted_value = case_when(
+      events == "single" ~ weights["single"],
+      events == "double" ~ weights["double"],
+      events == "triple" ~ weights["triple"],
+      events == "home_run" ~ weights["home_run"],
+      events == "walk" ~ weights["walk"],
+      events == "hit_by_pitch" ~ weights["hit_by_pitch"],
+      events == "sac_fly" ~ weights["sac_fly"],
+      TRUE ~ 0
+    )
+  )
+
+
+```
+
+
+
+
+## lineup order feature
+```{r}
+lineup_order <- savant %>%
+    group_by(game_pk) %>% 
+    filter(at_bat_number %in% 1:18, 
+           pitch_number == 1) %>% 
+    ungroup() %>% 
+    group_by(game_pk, inning_topbot, batter) %>%  
+    summarise(first_ab = min(at_bat_number, na.rm = TRUE), .groups = "drop") %>% 
+    arrange(game_pk, inning_topbot, first_ab) %>%  
+    group_by(game_pk, inning_topbot) %>% 
+    mutate(lineup_spot = row_number()) %>%  
+    ungroup()
+
+# Calculate most frequent lineup spot by game_year and batter
+most_frequent_lineup_spot <- lineup_order %>%
+    left_join(savant %>% select(game_pk, game_year), by = "game_pk") %>%  # Add game_year to lineup_order
+    group_by(batter, game_year, lineup_spot) %>%  
+    tally() %>% 
+    arrange(batter, game_year, desc(n)) %>%  
+    slice_max(n, n = 1, with_ties = FALSE) %>% 
+    select(-n) %>% 
+    rename(prev_most_frequent_lineup_spot = lineup_spot)
+
+
+most_frequent_lineup_spot$game_year = most_frequent_lineup_spot$game_year+1
+
+
+
+```
+
+
+## Creating season level woba, PAs and splits
+```{r}
+batters_L <- savant %>%
+  select(game_year, batter, pa_flag, weighted_value, woba_denom, p_throws) %>% 
+  filter(p_throws == "L") %>%
+  group_by(game_year, batter) %>%
+  summarise(
+    PAs_LHP = sum(pa_flag),
+    wOBA_LHP = sum(weighted_value, na.rm = TRUE) / sum(woba_denom, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+batters_R <- savant %>%
+  select(game_year, batter, pa_flag, weighted_value, woba_denom, p_throws) %>% 
+  filter(p_throws == "R") %>%
+  group_by(game_year, batter) %>%
+  summarise(
+    PAs_RHP = sum(pa_flag),
+    wOBA_RHP = sum(weighted_value, na.rm = TRUE) / sum(woba_denom, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+batters <- savant %>% 
+  select(game_year, batter, pa_flag, stand, estimated_woba_using_speedangle, weighted_value, woba_denom) %>%
+  group_by(game_year, batter) %>%
+  summarise(
+    PAs = sum(pa_flag),
+    xWOBA = mean(estimated_woba_using_speedangle, na.rm = TRUE),
+    wOBA = sum(weighted_value, na.rm = TRUE) / sum(woba_denom, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+batters_with_R <- left_join(batters, batters_R, by = c("game_year", "batter"))
+batters_full <- left_join(batters_with_R, batters_L, by = c("game_year", "batter"))
+
+
+# Weighting previous seasons based on 5-3-2
+# Define weight variables
+w1 <- 5
+w2 <- 3
+w3 <- 2
+
+batters_full_weighted <- batters_full %>%
+  group_by(batter) %>%
+  arrange(game_year) %>%
+  mutate(
+    weighted_PAs = {
+      num <- w1 * coalesce(lag(PAs, 1), 0) +
+             w2 * coalesce(lag(PAs, 2), 0) +
+             w3 * coalesce(lag(PAs, 3), 0)
+      denom <- if_else(is.na(lag(PAs, 1)), 0, w1) +
+               if_else(is.na(lag(PAs, 2)), 0, w2) +
+               if_else(is.na(lag(PAs, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_xWOBA = {
+      num <- w1 * coalesce(lag(xWOBA, 1), 0) +
+             w2 * coalesce(lag(xWOBA, 2), 0) +
+             w3 * coalesce(lag(xWOBA, 3), 0)
+      denom <- if_else(is.na(lag(xWOBA, 1)), 0, w1) +
+               if_else(is.na(lag(xWOBA, 2)), 0, w2) +
+               if_else(is.na(lag(xWOBA, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA = {
+      num <- w1 * coalesce(lag(wOBA, 1), 0) +
+             w2 * coalesce(lag(wOBA, 2), 0) +
+             w3 * coalesce(lag(wOBA, 3), 0)
+      denom <- if_else(is.na(lag(wOBA, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_PAs_LHP = {
+      num <- w1 * coalesce(lag(PAs_LHP, 1), 0) +
+             w2 * coalesce(lag(PAs_LHP, 2), 0) +
+             w3 * coalesce(lag(PAs_LHP, 3), 0)
+      denom <- if_else(is.na(lag(PAs_LHP, 1)), 0, w1) +
+               if_else(is.na(lag(PAs_LHP, 2)), 0, w2) +
+               if_else(is.na(lag(PAs_LHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA_LHP = {
+      num <- w1 * coalesce(lag(wOBA_LHP, 1), 0) +
+             w2 * coalesce(lag(wOBA_LHP, 2), 0) +
+             w3 * coalesce(lag(wOBA_LHP, 3), 0)
+      denom <- if_else(is.na(lag(wOBA_LHP, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA_LHP, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA_LHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_PAs_RHP = {
+      num <- w1 * coalesce(lag(PAs_RHP, 1), 0) +
+             w2 * coalesce(lag(PAs_RHP, 2), 0) +
+             w3 * coalesce(lag(PAs_RHP, 3), 0)
+      denom <- if_else(is.na(lag(PAs_RHP, 1)), 0, w1) +
+               if_else(is.na(lag(PAs_RHP, 2)), 0, w2) +
+               if_else(is.na(lag(PAs_RHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA_RHP = {
+      num <- w1 * coalesce(lag(wOBA_RHP, 1), 0) +
+             w2 * coalesce(lag(wOBA_RHP, 2), 0) +
+             w3 * coalesce(lag(wOBA_RHP, 3), 0)
+      denom <- if_else(is.na(lag(wOBA_RHP, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA_RHP, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA_RHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    }
+  ) %>%
+  ungroup() %>%
+  select(batter, game_year, PAs, starts_with("weighted"))
+
+```
+
+
+## Calculating defensive position counts
+```{r}
+
+# This gives the count of innings each player has started at each position in a year
+savant_2 <- savant %>%
+  select(game_date, game_year, inning, inning_topbot, game_pk, pitcher_1, 
+         fielder_2, fielder_3, fielder_4, fielder_5, fielder_6, fielder_7, fielder_8, fielder_9) %>%
+  filter(game_year<2024)
+
+savant_2_filtered <- savant_2 %>%
+  group_by(game_pk, inning, inning_topbot, game_year, .drop = FALSE) %>% 
+  slice_head(n = 1) %>% # Selects the first row for each "Top" and "Bot"
+  ungroup()
+
+
+Position_counts <- savant_2_filtered %>%
+  pivot_longer(
+    cols = c(pitcher_1, starts_with("fielder_")), # Include pitcher_1 and all fielder columns
+    names_to = "position",                       # New column indicating the position
+    values_to = "player_id"                      # Column with the player ID
+  ) %>%
+  group_by(player_id, game_year, position) %>%
+  summarize(count = n(), .groups = "drop") %>%  # Count occurrences
+  pivot_wider(
+    names_from = position, # Make positions columns (e.g., pitcher_1, fielder_2, etc.)
+    values_from = count,   # Fill columns with counts
+    values_fill = 0        # Replace NA with 0
+  ) %>%
+  arrange(player_id, game_year)
+
+# Create empty 2024 rows
+Position_2024 <- sample %>%
+  rename(player_id = PLAYER_ID) %>%
+  mutate(game_year = 2024) %>%
+  left_join(Position_counts %>% select(player_id) %>% distinct(), by = "player_id") %>%
+  mutate(across(starts_with("fielder_"), ~0), pitcher_1 = 0)
+
+# Append 2024 Data Back
+Position_counts <- bind_rows(Position_counts, Position_2024)
+
+
+# Add lagged features for position counts
+Position_counts_with_lags <- Position_counts %>%
+  group_by(player_id) %>%
+  arrange(game_year) %>%  # Ensure data is sorted by year for each player
+  mutate(
+    across(
+      starts_with("fielder_"), 
+      ~lag(.), 
+      .names = "prev_year_{.col}"  # Create lagged versions of fielder counts
+    ),
+    prev_year_pitcher_1 = lag(pitcher_1)  # Add lag for pitcher counts
+  ) %>%
+  ungroup() %>%
+  select(player_id, game_year, starts_with("prev_year"))
+
+
+Position_counts_with_lags <- Position_counts_with_lags %>%
+  rowwise() %>%  # Ensure calculations are done per row
+  mutate(prev_year_pos_played = sum(c_across(starts_with("prev_year_fielder_")) > 0, na.rm = TRUE)) %>%  
+  ungroup() %>%
+  select(player_id,game_year,prev_year_pitcher_1,prev_year_pos_played)
+
+
+
+```
+
+
+## Joining batting+positions
+```{r}
+batters_order_weighted <- left_join(batters_full_weighted,most_frequent_lineup_spot, by=c("batter","game_year"))
+# Combining batting stats with position counts
+batters_pos_weighted <- right_join(Position_counts_with_lags,batters_order_weighted, by=c("player_id"="batter", "game_year"))
+
+
+```
+
+
+
+
+## Defining pitcher roles
+```{r}
+
+pitcher_roles <- savant %>%
+  group_by(game_year, pitcher, game_pk) %>%
+  summarise(
+    batters_faced = sum(pa_flag),  # Total batters faced in each appearance
+    is_sp = max(sp_indicator)  # If started, it should be 1 for that game
+  ) %>%
+  ungroup() %>%
+  group_by(game_year, pitcher) %>%
+  summarise(
+    avg_bf_per_game = mean(batters_faced, na.rm = TRUE),
+    total_games = n(),
+    games_started = sum(is_sp),
+    games_relieved = total_games - games_started
+  ) %>%
+  ungroup()
+
+pitcher_roles <- pitcher_roles %>%
+  mutate(
+    role = case_when(
+      games_started / total_games >= 0.7 | avg_bf_per_game > 15 ~ "SP",
+      games_started / total_games < 0.3 & avg_bf_per_game < 8 ~ "RP")
+  )
+
+pitcher_roles <- pitcher_roles %>%
+  mutate(
+    is_starter = ifelse(role == "SP", 1, 0),
+    is_reliever = ifelse(role == "RP", 1, 0)) %>%
+  select(game_year,pitcher,is_reliever,is_starter,avg_bf_per_game )
+
+
+
+
+```
+
+
+## pitch count, velo and spin_rate
+```{r}
+
+#pitcher per batter
+pitchers_pitchcount <- savant %>%
+  select(game_year, pitcher, pa_flag, p_throws) %>% 
+  group_by(game_year, pitcher) %>%                # Group by year and pitcher
+  summarise(
+    BFs = sum(pa_flag, na.rm = TRUE),         # Sum up batters faced
+    pitches_per_BF = n() / BFs                  
+  ) %>%
+  ungroup()
+
+#median of top 10 velo
+velocity <- savant %>%
+    filter(!is.na(release_speed)) %>%  # Ensure no missing values
+    group_by(game_year, pitcher) %>%
+    slice_max(release_speed, n = 10, with_ties = FALSE) %>%  # Select top 10 fastest pitches
+    summarise(
+        median_top10_velocity = median(release_speed, na.rm = TRUE),  # Median of top 10 fastest
+    ) %>%
+    ungroup()
+# median of top 10 spin rate
+spin_rate <-savant %>%
+    filter(!is.na(release_spin_rate),
+           pitch_type %in% c("SL", "CU", "KC", "SV", "ST", "SC")) %>% #only breaking balls 
+    group_by(game_year, pitcher) %>%
+    slice_max(release_spin_rate, n = 10, with_ties = FALSE) %>%  #Select top 10 spin rates
+    summarise(
+        median_top10_spin_rate = median(release_spin_rate, na.rm = TRUE)) %>%
+    ungroup()
+
+```
+
+
+## woba, BFs splits for pitchers
+```{r}
+pitchers_L <- savant %>%
+  select(game_year, pitcher, pa_flag, weighted_value, woba_denom, stand) %>% 
+  filter(stand == "L") %>%
+  group_by(game_year, pitcher) %>%
+  summarise(
+    BFs_LHP = sum(pa_flag),            # Sum up plate appearances
+    wOBA_LHP = sum(weighted_value,na.rm=TRUE)/sum(woba_denom, na.rm=TRUE)) %>%
+  ungroup()
+
+pitchers_R <- savant %>%
+  select(game_year, pitcher, pa_flag, weighted_value, woba_denom, stand) %>% 
+  filter(stand == "R") %>%
+  group_by(game_year, pitcher) %>%
+  summarise(
+    BFs_RHP = sum(pa_flag),            # Sum up plate appearances
+    wOBA_RHP = sum(weighted_value,na.rm=TRUE)/sum(woba_denom, na.rm=TRUE)) %>%
+  ungroup()
+
+pitcher_woba <- savant %>% 
+  select(game_year, pitcher, pa_flag, p_throws, estimated_woba_using_speedangle, weighted_value, woba_denom) %>% 
+  group_by(game_year, pitcher) %>%
+  summarise(
+    BFs = sum(pa_flag),            # Sum up plate appearances
+    xWOBA = mean(estimated_woba_using_speedangle,na.rm=TRUE),
+    wOBA = sum(weighted_value,na.rm = TRUE)/sum(woba_denom,na.rm = TRUE)) %>%
+  ungroup()
+
+
+
+pitchers_with_R <- left_join(pitcher_woba,pitchers_R, by=c("game_year","pitcher"))
+
+pitchers <- left_join(pitchers_with_R,pitchers_L, by=c("game_year","pitcher") )
+
+# Define weight variables
+w1 <- 5
+w2 <- 3
+w3 <- 2
+
+pitchers_full_weighted <- pitchers %>%
+  group_by(pitcher) %>%
+  arrange(game_year) %>%
+  mutate(
+    weighted_BFs = {
+      num <- w1 * coalesce(lag(BFs, 1), 0) +
+             w2 * coalesce(lag(BFs, 2), 0) +
+             w3 * coalesce(lag(BFs, 3), 0)
+      denom <- if_else(is.na(lag(BFs, 1)), 0, w1) +
+               if_else(is.na(lag(BFs, 2)), 0, w2) +
+               if_else(is.na(lag(BFs, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_xWOBA = {
+      num <- w1 * coalesce(lag(xWOBA, 1), 0) +
+             w2 * coalesce(lag(xWOBA, 2), 0) +
+             w3 * coalesce(lag(xWOBA, 3), 0)
+      denom <- if_else(is.na(lag(xWOBA, 1)), 0, w1) +
+               if_else(is.na(lag(xWOBA, 2)), 0, w2) +
+               if_else(is.na(lag(xWOBA, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA = {
+      num <- w1 * coalesce(lag(wOBA, 1), 0) +
+             w2 * coalesce(lag(wOBA, 2), 0) +
+             w3 * coalesce(lag(wOBA, 3), 0)
+      denom <- if_else(is.na(lag(wOBA, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_BFs_LHP = {
+      num <- w1 * coalesce(lag(BFs_LHP, 1), 0) +
+             w2 * coalesce(lag(BFs_LHP, 2), 0) +
+             w3 * coalesce(lag(BFs_LHP, 3), 0)
+      denom <- if_else(is.na(lag(BFs_LHP, 1)), 0, w1) +
+               if_else(is.na(lag(BFs_LHP, 2)), 0, w2) +
+               if_else(is.na(lag(BFs_LHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA_LHP = {
+      num <- w1 * coalesce(lag(wOBA_LHP, 1), 0) +
+             w2 * coalesce(lag(wOBA_LHP, 2), 0) +
+             w3 * coalesce(lag(wOBA_LHP, 3), 0)
+      denom <- if_else(is.na(lag(wOBA_LHP, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA_LHP, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA_LHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_BFs_RHP = {
+      num <- w1 * coalesce(lag(BFs_RHP, 1), 0) +
+             w2 * coalesce(lag(BFs_RHP, 2), 0) +
+             w3 * coalesce(lag(BFs_RHP, 3), 0)
+      denom <- if_else(is.na(lag(BFs_RHP, 1)), 0, w1) +
+               if_else(is.na(lag(BFs_RHP, 2)), 0, w2) +
+               if_else(is.na(lag(BFs_RHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    },
+    weighted_wOBA_RHP = {
+      num <- w1 * coalesce(lag(wOBA_RHP, 1), 0) +
+             w2 * coalesce(lag(wOBA_RHP, 2), 0) +
+             w3 * coalesce(lag(wOBA_RHP, 3), 0)
+      denom <- if_else(is.na(lag(wOBA_RHP, 1)), 0, w1) +
+               if_else(is.na(lag(wOBA_RHP, 2)), 0, w2) +
+               if_else(is.na(lag(wOBA_RHP, 3)), 0, w3)
+      if_else(denom == 0, NA_real_, num / denom)
+    }
+  ) %>%
+  ungroup() %>%
+  select(pitcher, game_year, BFs, starts_with("weighted"))
+
+
+
+```
+
+
+## Combing pitcher datasets
+```{r}
+
+# Combine all pitcher datasets
+combined_pitcher_data <- pitchers_pitchcount %>%
+  left_join(velocity, by = c("game_year", "pitcher")) %>%
+  left_join(spin_rate, by = c("game_year", "pitcher")) %>%
+  left_join(pitcher_roles, by = c("game_year", "pitcher"))
+
+# Create Lagged Features
+combined_pitcher_data_with_lags <- combined_pitcher_data %>%
+  group_by(pitcher) %>%
+  arrange(game_year) %>%  # Ensure data is sorted by year for each pitcher
+  mutate(
+    prev_year_pitches_per_BF = lag(pitches_per_BF),
+    prev_year_median_top10_velocity = lag(median_top10_velocity),
+    prev_year_median_top10_spin_rate = lag(median_top10_spin_rate),
+    prev_year_is_starter = lag(is_starter),
+    prev_year_is_reliever = lag(is_reliever),
+    prev_year_avg_bf_per_game = lag(avg_bf_per_game)
+  ) %>%
+  ungroup() %>%
+  select(
+    game_year,
+    pitcher,
+    starts_with("prev_year_")  # Keep only lagged columns
+  )
+
+
+#join lagged features with BFs and woba
+Pitchers_full <- left_join(pitchers_full_weighted,combined_pitcher_data_with_lags, by=c("game_year","pitcher"))
+
+
+```
+
+
+
+
+
+## Joining features with Lahman data and removing outliers
+```{r}
+# Combining batters final with lahman
+
+batters_comb <- left_join(batters_pos_weighted, batters_lahman, by=c("player_id"="id", "game_year")) %>%
+                drop_na(weighted_PAs, PAs)  # Drop only relevant columns
+pitchers_comb <- left_join(Pitchers_full, pitchers_lahman, by=c("pitcher"="id", "game_year")) %>%
+                drop_na(weighted_BFs, BFs)
+
+batters_comb <- batters_comb %>%  mutate(across(everything(), ~ ifelse(is.infinite(.), NA, .)))
+pitchers_comb <- pitchers_comb %>%  mutate(across(everything(), ~ ifelse(is.infinite(.), NA, .)))
+
+
+
+batters_2024 <- batters_comb %>% filter(game_year==2024, coalesce(prev_year_pitcher_1, 0) < 5)
+
+
+pitchers_2024 <- pitchers_comb %>% filter(game_year==2024, weighted_BFs>1)
+
+
+# removing low PA counts
+batters_final <- batters_comb %>% filter(weighted_PAs>200,
+                                          prev_year_pitcher_1<5,
+                                          game_year<2024)
+
+pitchers_final <- pitchers_comb %>% filter(weighted_BFs>150,
+                                            game_year<2024)
+
+```
+
+## Batters model
+```{r}
+set.seed(123)
+# Train-Test Split
+player_ids <- unique(batters_final$player_id)
+train_player_ids <- sample(unique(batters_final$player_id), size = round(0.8 * length(unique(batters_final$player_id))), replace = FALSE)
+
+train_df <- batters_final %>% filter(player_id %in% train_player_ids)
+test_df  <- batters_final %>% filter(!player_id %in% train_player_ids)
+
+# Preparing Data Matrices
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df %>% select(-c(player_id, PAs, game_year))),
+  label = train_df$PAs
+)
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df %>% select(-c(player_id, PAs, game_year))),
+  label = test_df$PAs
+)
+
+param_grid <- expand.grid(
+  max_depth = c(3, 4, 5),
+  eta = c(0.01, 0.05),
+  min_child_weight = c(5, 10),
+  subsample = c(0.5, 0.7),
+  colsample_bytree = c(0.5, 0.7),
+  lambda = c(2, 5, 10),
+  alpha = c(1, 5, 10)
+)
+
+# Hyperparameter Grid Search
+# param_grid <- expand.grid(
+#   max_depth = c(3, 5, 7),
+#   eta = c(0.01, 0.05, 0.1),
+#   min_child_weight = c(1, 3, 5),
+#   subsample = c(0.7, 0.8, 1.0),
+#   colsample_bytree = c(0.7, 0.8, 1.0),
+#   lambda = c(0.5, 1, 1.5),
+#   alpha = c(0, 0.5, 1)
+# )
+
+cv_results <- lapply(1:nrow(param_grid), function(i) {
+  params <- as.list(param_grid[i, ])
+  params$objective <- "reg:squarederror"
+  params$eval_metric <- "rmse"
+  
+  cv <- xgb.cv(
+    params = params,
+    data = train_matrix,
+    nrounds = 1000,
+    nfold = 5,
+    early_stopping_rounds = 50,
+    verbose = FALSE
+  )
+  
+  list(
+    params = params,
+    best_rmse = min(cv$evaluation_log$test_rmse_mean),
+    best_iteration = which.min(cv$evaluation_log$test_rmse_mean)
+  )
+})
+
+best_result <- cv_results[[which.min(sapply(cv_results, function(x) x$best_rmse))]]
+cat("Best Parameters:\n")
+print(best_result$params)
+cat("Best RMSE:", best_result$best_rmse, "\n")
+cat("Best Iteration:", best_result$best_iteration, "\n")
+
+# Final Model Training
+best_params <- best_result$params
+best_params$objective <- "reg:squarederror"
+best_params$eval_metric <- "rmse"
+
+```
+
+```{r}
+final_model <- xgb.train(
+  params = best_params,
+  data = train_matrix,
+  nrounds = best_result$best_iteration,
+  watchlist = list(train = train_matrix, test = test_matrix),
+  verbose = 1
+)
+
+
+
+# Predictions and Evaluation
+final_preds <- predict(final_model, test_matrix)
+final_rmse <- sqrt(mean((test_df$PAs - final_preds)^2))
+cat("Final Test RMSE:", final_rmse, "\n")
+
+# Feature Importance
+importance_matrix <- xgb.importance(model = final_model)
+xgb.plot.importance(importance_matrix, top_n = 25, measure = "Gain")
+
+
+
+
+# Generate importance matrix
+importance_matrix <- xgb.importance(model = final_model)
+
+# Convert to data frame for ggplot
+importance_df <- importance_matrix  # Select top 25 features
+
+# Create a custom ggplot importance plot
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "red4", alpha = 0.8) +  # Professional color scheme
+  coord_flip() +  # Horizontal bars for readability
+  ggtitle("Feature Importance (Batters)") +
+  theme_minimal(base_size = 14) +  # Clean theme
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),  # Centered, bold title
+    axis.title.x = element_text(size = 14, face = "bold"),  # Larger x-axis label
+    axis.title.y = element_text(size = 14, face = "bold"),  # Larger y-axis label
+    axis.text = element_text(size = 12),  # Increase tick label size
+    panel.grid.major = element_line(color = "grey80"),  # Subtle grid lines
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Features", y = "Feature Importance (Gain)")
+
+
+
+ggplot(test_df, aes(x = PAs, y = final_preds)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Actual vs. Predicted BFs", x = "Actual BFs", y = "Predicted BFs") +
+  theme_minimal()
+
+```
+
+
+
+## Secondary low sample batters model
+```{r}
+# Remove NAs before training the model
+batters_comb_clean <- batters_comb %>% filter(prev_year_pitcher_1<5,
+                                          game_year<2024) %>% drop_na(age, weighted_PAs, PAs) 
+
+# Train secondary model
+secondary_model_batters <- lm(PAs ~ age + 
+                        weighted_PAs, data = batters_comb_clean)
+
+
+summary(secondary_model_batters)
+
+
+# Filter small sample players
+small_sample_df <- batters_comb %>% 
+  filter(weighted_PAs < 200, game_year < 2024, prev_year_pitcher_1 < 5) %>%
+  drop_na(age, weighted_PAs)  # Drop NAs before predicting
+
+# Make predictions
+small_sample_df <- small_sample_df %>%
+  mutate(predicted_PAs = predict(secondary_model_batters, newdata = small_sample_df))
+
+# Compute RMSE
+rmse <- sqrt(mean((small_sample_df$PAs - small_sample_df$predicted_PAs)^2, na.rm = TRUE))
+
+
+# Print RMSE
+cat("Final Test RMSE:", rmse, "\n") 
+
+```
+
+
+
+
+
+## Predicting 2024 Batters
+```{r}
+# Ensure df_2024 has only necessary features
+new_data_matrix <- xgb.DMatrix(
+  data = as.matrix(batters_2024 %>% select(-c(player_id, game_year,PAs)))
+)
+
+batters_2024 <- batters_2024 %>% mutate(predicted_PAs = predict(final_model, new_data_matrix),
+                                        low_sample_predicted_PAs = 
+                                          predict(secondary_model_batters, batters_2024))
+
+```
+
+
+# Pitchers model
+```{r}
+set.seed(123)
+# Train-Test Split
+player_ids <- unique(pitchers_final$pitcher)
+train_player_ids <- sample(unique(pitchers_final$pitcher), size = round(0.8 * length(unique(pitchers_final$pitcher))), replace = FALSE)
+
+train_df <- pitchers_final %>% 
+  filter(pitcher %in% train_player_ids)
+test_df  <- pitchers_final %>% filter(!pitcher %in% train_player_ids)
+
+
+
+# Preparing Data Matrices with Weights
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df %>% select(-c(pitcher, BFs, game_year))), 
+  label = train_df$BFs,
+)
+
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df %>% select(-c(pitcher, BFs, game_year))),
+  label = test_df$BFs
+)
+
+
+# Hyperparameter Grid Search
+# param_grid <- expand.grid(
+#   max_depth = c(3, 5, 7),
+#   eta = c(0.01, 0.05, 0.1),
+#   min_child_weight = c(1, 3, 5),
+#   subsample = c(0.7, 0.8, 1.0),
+#   colsample_bytree = c(0.7, 0.8, 1.0),
+#   lambda = c(0.5, 1, 1.5),
+#   alpha = c(0, 0.5, 1)
+# )
+
+# param_grid <- expand.grid(
+#   max_depth = c(3, 5),
+#   eta = c(0.05, 0.1),
+#   min_child_weight = c(1, 5),
+#   subsample = c(0.8, 1.0),
+#   colsample_bytree = c(0.8, 1.0),
+#   lambda = c(0.5, 1, 1.5),
+#   alpha = c(0, 0.5, 1)
+# )
+param_grid <- expand.grid(
+  max_depth = c(3, 4, 5),
+  eta = c(0.01, 0.05),
+  min_child_weight = c(5, 10),
+  subsample = c(0.5, 0.7),
+  colsample_bytree = c(0.5, 0.7),
+  lambda = c(2, 5, 10),
+  alpha = c(1, 5, 10)
+)
+
+cv_results <- lapply(1:nrow(param_grid), function(i) {
+  params <- as.list(param_grid[i, ])
+  params$objective <- "reg:squarederror"
+  params$eval_metric <- "rmse"
+  
+  cv <- xgb.cv(
+    params = params,
+    data = train_matrix,
+    nrounds = 1000,  # ⬆ More rounds to accommodate lower eta
+    nfold = 5,
+    early_stopping_rounds = 50,  # ⬆ Increase early stopping patience
+    verbose = FALSE
+  )
+  
+  list(
+    params = params,
+    best_rmse = min(cv$evaluation_log$test_rmse_mean),
+    best_iteration = which.min(cv$evaluation_log$test_rmse_mean)
+  )
+})
+
+best_result <- cv_results[[which.min(sapply(cv_results, function(x) x$best_rmse))]]
+
+cat("Best Parameters:\n")
+print(best_result$params)
+cat("Best RMSE:", best_result$best_rmse, "\n")
+cat("Best Iteration:", best_result$best_iteration, "\n")
+
+# Final Model Training
+best_params <- best_result$params
+best_params$objective <- "reg:squarederror"
+best_params$eval_metric <- "rmse"
+
+final_model <- xgb.train(
+  params = best_params,
+  data = train_matrix,
+  nrounds = best_result$best_iteration,
+  watchlist = list(train = train_matrix, test = test_matrix),
+  verbose = 1
+)
+
+```
+
+```{r}
+final_model <- xgb.train(
+  params = best_params,
+  data = train_matrix,
+  nrounds = best_result$best_iteration,
+  watchlist = list(train = train_matrix, test = test_matrix),
+  verbose = 1
+)
+
+# Predictions and Evaluation
+final_preds <- predict(final_model, test_matrix)
+final_rmse <- sqrt(mean((test_df$BFs - final_preds)^2))
+cat("Final Test RMSE:", final_rmse, "\n")
+
+# Feature Importance
+importance_matrix <- xgb.importance(model = final_model)
+xgb.plot.importance(importance_matrix, top_n = 25, measure = "Gain")
+
+
+# Generate importance matrix
+importance_matrix <- xgb.importance(model = final_model)
+
+# Convert to data frame for ggplot
+importance_df <- importance_matrix  # Select top 25 features
+
+# Create a custom ggplot importance plot
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +  # Professional color scheme
+  coord_flip() +  # Horizontal bars for readability
+  ggtitle("Feature Importance (Pitchers)") +
+  theme_minimal(base_size = 14) +  # Clean theme
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),  # Centered, bold title
+    axis.title.x = element_text(size = 14, face = "bold"),  # Larger x-axis label
+    axis.title.y = element_text(size = 14, face = "bold"),  # Larger y-axis label
+    axis.text = element_text(size = 12),  # Increase tick label size
+    panel.grid.major = element_line(color = "grey80"),  # Subtle grid lines
+    panel.grid.minor = element_blank()
+  ) +
+  labs(x = "Features", y = "Feature Importance (Gain)")
+
+
+ggplot(test_df, aes(x = BFs, y = final_preds)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Actual vs. Predicted BFs", x = "Actual BFs", y = "Predicted BFs") +
+  theme_minimal()
+
+
+```
+
+
+
+
+# Low Sample Model Pitchers
+```{r}
+# Remove NAs before training the model
+pitchers_comb_clean <- pitchers_comb %>% filter(weighted_BFs>0, game_year<2024) %>%
+  drop_na(age, BFs)
+
+# Train secondary model
+secondary_model_pitchers <- lm(BFs ~ age + weighted_BFs, 
+                        data = pitchers_comb_clean)
+
+
+summary(secondary_model_pitchers)
+
+
+# Filter small sample players
+small_sample_df <- pitchers_comb %>% 
+  filter(weighted_BFs < 150, game_year < 2024) %>%
+  drop_na(age, weighted_BFs)  # Drop NAs before predicting
+
+# Make predictions
+small_sample_df <- small_sample_df %>%
+  mutate(predicted_BFs = predict(secondary_model_pitchers, newdata = small_sample_df))
+
+# Compute RMSE
+rmse <- sqrt(mean((small_sample_df$BFs - small_sample_df$predicted_BFs)^2, na.rm = TRUE))
+
+
+# Print RMSE
+cat("Final Test RMSE:", rmse, "\n")
+
+```
+
+
+## Predicting for 2024 Pitchers
+```{r}
+# Ensure df_2024 has only necessary features
+new_data_matrix <- xgb.DMatrix(
+  data = as.matrix(pitchers_2024 %>% select(-c(pitcher, game_year,BFs)))
+)
+
+
+pitchers_2024 <- pitchers_2024 %>% mutate(predicted_BFs = predict(final_model, new_data_matrix),
+                                        low_sample_predicted_BFs = 
+                                          predict(secondary_model_pitchers, pitchers_2024))
+
+
+
+```
+
+
+
+
+
+## Making final df for submission
+```{r}
+#
+batters_2024$predicted_PAs <- ifelse(batters_2024$weighted_PAs<200, 
+                                     batters_2024$low_sample_predicted_PAs, 
+                                     batters_2024$predicted_PAs)
+
+batters_2024$predicted_PAs <- ifelse(batters_2024$predicted_PAs<0, 
+                                     batters_2024$weighted_PAs, 
+                                     batters_2024$predicted_PAs)
+
+batters_2024_final <- batters_2024 %>% select(player_id,predicted_PAs)
+
+pitchers_2024$predicted_BFs <- ifelse(pitchers_2024$weighted_BFs<150, 
+                                     pitchers_2024$low_sample_predicted_BFs, 
+                                     pitchers_2024$predicted_BFs)
+
+pitchers_2024$predicted_BFs <- ifelse(pitchers_2024$predicted_BFs<0, 
+                                     pitchers_2024$weighted_BFs, 
+                                     pitchers_2024$predicted_BFs)
+
+pitchers_2024_final <- pitchers_2024 %>% select(pitcher,predicted_BFs)
+
+submission_df <- sample %>% left_join(batters_2024_final,by=c("PLAYER_ID"="player_id"))
+submission_df <- submission_df %>% left_join(pitchers_2024_final,by=c("PLAYER_ID"="pitcher"))
+
+
+submission_df$PLAYING_TIME <- pmax(submission_df$predicted_PAs, submission_df$predicted_BFs, na.rm = TRUE)
+
+
+submission_df <- submission_df %>% select(PLAYER_ID,PLAYING_TIME)
+
+write_csv(submission_df,"reds_submission_final.csv")
+
+
+```
+
+
+
+# Exporting dataset for graphs
+```{r}
+
+batter_age <- batters_comb %>% select(player_id,game_year,PAs,age,weighted_PAs)
+
+pitcher_age <- pitchers_comb %>% select(pitcher,game_year,BFs,age)
+
+
+write_csv(batter_age,"batter_age.csv")
+write_csv(pitcher_age,"pitcher_age.csv")
+
+
+
+```
+

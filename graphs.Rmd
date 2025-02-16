@@ -1,0 +1,61 @@
+---
+title: "Graphs"
+author: "Chris Galgano"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+
+batter_age <- read.csv("batter_age.csv")
+pitcher_age <- read.csv("pitcher_age.csv")
+
+```
+
+
+Graph
+
+```{r}
+
+
+pa_change_by_age <- batter_age %>%
+  arrange(player_id, game_year) %>%  # Ensure data is ordered correctly
+  group_by(player_id) %>%
+  mutate(PA_change = PAs - lag(PAs)) %>%  # Compute change in PAs from previous year
+  ungroup() %>%
+  group_by(age) %>%
+  summarize(
+    avg_PA_change = mean(PA_change, na.rm = TRUE),  # Average change in PAs per age
+    median_PA_change = median(PA_change, na.rm = TRUE),  # Median change per age
+    count = n()  # Number of players with PA change at each age
+  ) %>%
+  filter(count>5) %>%
+  arrange(age)  # Sort results by age
+
+bf_change_by_age <- pitcher_age %>%
+  arrange(pitcher, game_year) %>%  # Ensure data is ordered correctly
+  group_by(pitcher) %>%
+  mutate(BF_change = BFs - lag(BFs)) %>%  # Compute change in PAs from previous year
+  ungroup() %>%
+  group_by(age) %>%
+  summarize(
+    avg_BF_change = mean(BF_change, na.rm = TRUE),  # Average change in PAs per age
+    median_BF_change = median(BF_change, na.rm = TRUE),  # Median change per age
+    count = n()  # Number of players with PA change at each age
+  ) %>%
+  filter(count>5) %>%
+  arrange(age)  # Sort results by age
+
+
+
+ggplot(data = pa_change_by_age,aes(x=age,y=median_PA_change)) + geom_point()
+
+
+ggplot(data = bf_change_by_age,aes(x=age,y=median_BF_change)) + geom_point()
+
+
+```
+
+
+
